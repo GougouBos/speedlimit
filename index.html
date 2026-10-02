@@ -109,6 +109,17 @@ main {
   background: var(--sign-ring); color: #fff;
 }
 #start button:active { transform: scale(.97); }
+
+/* Floating-window (picture-in-picture) button */
+#pip {
+  position: fixed; top: calc(env(safe-area-inset-top) + 12px); right: calc(env(safe-area-inset-right) + 12px);
+  font: inherit; font-size: 15px; font-weight: 600;
+  padding: 10px 16px; border-radius: 999px; border: 1px solid #333;
+  background: #1c1c1e; color: var(--text);
+}
+/* The floating window is a video of this hidden drawing. iPhone won't play a video
+   that isn't on screen, so it sits in a corner, 2 px wide and almost invisible. */
+#pipVideo { position: fixed; left: 0; bottom: 0; width: 2px; height: 2px; opacity: .01; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -128,6 +139,8 @@ main {
   </div>
 </main>
 <div class="credit">© OpenStreetMap contributors</div>
+<button id="pip" hidden>Pop out ⧉</button>
+<video id="pipVideo" muted playsinline autoplay></video>
 
 <script>
 /* ============================================================
@@ -264,6 +277,7 @@ function distance(a, b) {
 }
 
 function onPosition(pos) {
+  lastFix = Date.now();
   const c = pos.coords, here = [c.latitude, c.longitude];
   let heading = (c.heading != null && c.heading >= 0 && !isNaN(c.heading)) ? c.heading : null;
   let speed = (c.speed != null && c.speed >= 0) ? c.speed * 3.6 : null;
@@ -310,11 +324,92 @@ function render(limit, speed, tags, accuracy) {
   }
   $('speed').textContent = kmh;
   $('road').textContent = tags ? (tags.name || tags.ref || tags.highway.replace('_', ' ')) : ' ';
-  document.body.classList.toggle('over', !!limit && kmh > limit.value + CONFIG.tolerance);
+  const over = !!limit && kmh > limit.value + CONFIG.tolerance;
+  document.body.classList.toggle('over', over);
+  view = { text: $('limit').textContent, unknown: !limit, estimated: !!limit?.estimated, kmh, over };
+  drawPip();
   if (!fetching && Date.now() > retryAt) setStatus(accuracy > 50 ? `Weak GPS (±${Math.round(accuracy)} m)` : '');
 }
 
 function setStatus(t) { $('status').textContent = t; }
+
+/* ---------- floating window (picture-in-picture) ----------
+   iPhone can only float videos over other apps. So we draw the sign onto a
+   hidden canvas and turn that drawing into a live video. */
+const pipCanvas = document.createElement('canvas');
+pipCanvas.width = 480; pipCanvas.height = 270;
+const pctx = pipCanvas.getContext('2d');
+const pipVideo = $('pipVideo');
+let view = { text: '–', unknown: true, estimated: false, kmh: 0, over: false };
+let lastFix = 0;
+
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+function drawPip() {
+  const W = pipCanvas.width, H = pipCanvas.height, now = Date.now();
+  const stale = now - lastFix > 5000;               // no GPS for 5 s → don't trust the numbers
+  const blink = Math.floor(now / 500) % 2 === 0;
+  const font = cssVar('--font');
+
+  pctx.fillStyle = cssVar(view.over && !stale && blink ? '--alert-bg' : '--bg');
+  pctx.fillRect(0, 0, W, H);
+
+  // Sign on the left
+  const r = H * 0.42, cx = H / 2 + 10, cy = H / 2;
+  pctx.globalAlpha = view.unknown || stale ? 0.35 : 1;
+  pctx.fillStyle = cssVar('--sign-ring');
+  pctx.beginPath(); pctx.arc(cx, cy, r, 0, Math.PI * 2); pctx.fill();
+  pctx.fillStyle = cssVar('--sign-fill');
+  pctx.beginPath(); pctx.arc(cx, cy, r * 0.78, 0, Math.PI * 2); pctx.fill();
+  pctx.fillStyle = cssVar('--sign-text');
+  pctx.textAlign = 'center'; pctx.textBaseline = 'middle';
+  pctx.font = `800 ${Math.round(r * (view.text.length >= 3 ? 0.62 : 0.8))}px ${font}`;
+  pctx.fillText(view.text, cx, cy + r * 0.04);
+  if (view.estimated) {
+    pctx.fillStyle = cssVar('--muted'); pctx.font = `600 ${Math.round(r * 0.14)}px ${font}`;
+    pctx.fillText('EST.', cx, cy + r * 0.52);
+  }
+  pctx.globalAlpha = 1;
+
+  // Your speed on the right
+  const rx = H + (W - H) / 2;
+  pctx.fillStyle = cssVar('--text'); pctx.font = `700 96px ${font}`;
+  pctx.fillText(stale ? '–' : String(view.kmh), rx, cy - 12);
+  pctx.fillStyle = cssVar('--muted'); pctx.font = `500 28px ${font}`;
+  pctx.fillText(stale ? 'no GPS' : 'km/h', rx, cy + 52);
+
+  // Blinking dot = the app is alive. If it stops blinking, the picture is frozen.
+  if (blink) {
+    pctx.fillStyle = stale ? '#8a8a8f' : '#30d158';
+    pctx.beginPath(); pctx.arc(W - 20, 20, 7, 0, Math.PI * 2); pctx.fill();
+  }
+}
+
+function setupPip() {
+  if (!pipCanvas.captureStream) return;
+  drawPip();
+  pipVideo.srcObject = pipCanvas.captureStream(10);
+  pipVideo.play().catch(() => {});
+  setInterval(drawPip, 250);
+  const canPip = document.pictureInPictureEnabled ||
+                 pipVideo.webkitSupportsPresentationMode?.('picture-in-picture');
+  $('pip').hidden = !canPip;
+}
+
+function togglePip() {
+  try {
+    if (pipVideo.paused) pipVideo.play().catch(() => {});
+    if (typeof pipVideo.webkitSetPresentationMode === 'function') {   // Safari / iPhone
+      const on = pipVideo.webkitPresentationMode === 'picture-in-picture';
+      pipVideo.webkitSetPresentationMode(on ? 'inline' : 'picture-in-picture');
+    } else if (document.pictureInPictureElement) {
+      document.exitPictureInPicture();
+    } else {
+      pipVideo.requestPictureInPicture().catch(() => setStatus('Floating window not available'));
+    }
+  } catch (e) { setStatus('Floating window not available'); }
+}
+$('pip').addEventListener('click', togglePip);
 
 /* ---------- keep the screen on ---------- */
 let wakeLock = null;
@@ -331,6 +426,7 @@ function start() {
   started = true;
   $('start').hidden = true;
   keepAwake();
+  setupPip();
   setStatus('Waiting for GPS…');
 
   // Test mode: add ?sim=lat,lon,heading,speed to the URL to fake a position
